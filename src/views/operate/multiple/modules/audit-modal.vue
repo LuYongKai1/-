@@ -1,0 +1,372 @@
+<script setup lang="ts">
+import { NModal, NDataTable, NButton, NSpace } from "naive-ui";
+import type { DataTableColumns } from "naive-ui";
+import { computed, h, ref, watch, onMounted } from "vue";
+import { $t } from "@/locales";
+import { parseGoodsJson } from "@/utils/item";
+import { useItemPackage } from "@/hooks/business/useItemPackage";
+import { NTag } from "naive-ui";
+
+defineOptions({
+  name: "AuditModal",
+});
+
+interface ServerData {
+  roleId: string;
+  roleName?: string;
+  serverId: string;
+  serverName?: string;
+  success?: boolean;
+  ok?: boolean;
+  message?: string;
+  msg?: string;
+  goodsJson?: string;
+  item_ids?: number[];
+  item_counts?: number[];
+}
+
+interface Props {
+  serverData: ServerData[] | null;
+  goodsJson?: string;
+  loading?: boolean;
+}
+
+const props = defineProps<Props>();
+
+interface Emits {
+  (e: "approve"): void;
+  (e: "reject"): void;
+}
+
+const emit = defineEmits<Emits>();
+
+const visible = defineModel<boolean>("visible", {
+  default: false,
+});
+
+// 分页状态
+const currentPage = ref(1);
+const pageSize = ref(10);
+
+// 独立的按钮 loading 状态
+const approveLoading = ref(false);
+const rejectLoading = ref(false);
+
+// 物品数据
+const itemData = ref<any>(null);
+const itemDataLoading = ref(false);
+
+// 获取物品数据
+async function loadItemData() {
+  if (itemData.value || itemDataLoading.value) {
+    return;
+  }
+  itemDataLoading.value = true;
+  try {
+    const data = await useItemPackage();
+    itemData.value = data;
+  } catch (error) {
+    console.error("获取物品数据失败:", error);
+    itemData.value = null;
+  } finally {
+    itemDataLoading.value = false;
+  }
+}
+
+// 组件挂载时加载物品数据
+onMounted(() => {
+  loadItemData();
+});
+
+
+// 解析单个角色的物品信息
+function parseRoleItems(row: ServerData, rowIndex: number) {
+  // 1. 优先使用角色自己的 goodsJson
+  if (row.goodsJson) {
+    return parseGoodsJson(row.goodsJson, itemData.value);
+  }
+
+  // 2. 如果角色有 item_ids 和 item_counts，构造 goodsJson
+  if (row.item_ids && row.item_counts) {
+    const goodsJson = JSON.stringify([{ item_ids: row.item_ids, item_counts: row.item_counts }]);
+    return parseGoodsJson(goodsJson, itemData.value);
+  }
+
+  // 3. 从全局 goodsJson 数组中根据索引获取对应角色的物品数据
+  if (!props.goodsJson) return [];
+
+  try {
+    const goodsData = JSON.parse(props.goodsJson);
+    if (!Array.isArray(goodsData)) {
+      // 单个对象格式，所有角色使用相同的物品
+      return parseGoodsJson(props.goodsJson, itemData.value);
+    }
+
+    // 数组格式，需要判断是多个角色对象还是单个对象包含所有物品
+    if (goodsData.length === 0) return [];
+
+    const totalRoles = props.serverData?.length || 0;
+    const originalIndex = (currentPage.value - 1) * pageSize.value + rowIndex;
+
+    // 如果 goodsData 长度等于角色数量，说明每个对象对应一个角色
+    if (goodsData.length === totalRoles) {
+      const roleGoods = goodsData[originalIndex];
+      return roleGoods ? parseGoodsJson(JSON.stringify([roleGoods]), itemData.value) : [];
+    }
+
+    // 如果 goodsData 只有一个对象，需要检查是否需要分割物品
+    if (goodsData.length === 1) {
+      const singleGoods = goodsData[0];
+      const itemIds = singleGoods.item_ids || [];
+      const itemCounts = singleGoods.item_counts || [];
+
+      // 如果物品数量是角色数量的整数倍，说明需要分割
+      if (itemIds.length > 0 && itemIds.length % totalRoles === 0) {
+        const itemsPerRole = itemIds.length / totalRoles;
+        const startIdx = originalIndex * itemsPerRole;
+        const endIdx = startIdx + itemsPerRole;
+
+        const roleItemIds = itemIds.slice(startIdx, endIdx);
+        const roleItemCounts = itemCounts.slice(startIdx, endIdx);
+
+        if (roleItemIds.length > 0) {
+          return parseGoodsJson(
+            JSON.stringify([{ item_ids: roleItemIds, item_counts: roleItemCounts }]),
+            itemData.value
+          );
+        }
+      }
+
+      // 否则所有角色使用相同的物品
+      return parseGoodsJson(JSON.stringify([singleGoods]), itemData.value);
+    }
+
+    // 其他情况，尝试根据索引获取
+    const roleGoods = goodsData[originalIndex];
+    return roleGoods ? parseGoodsJson(JSON.stringify([roleGoods]), itemData.value) : [];
+  } catch (error) {
+    console.error('解析 goodsJson 失败:', error);
+    return [];
+  }
+}
+
+// 格式化物品显示（返回标签数组）
+function formatItemsTags(row: ServerData, rowIndex: number) {
+  const parsedItems = parseRoleItems(row, rowIndex);
+
+  if (parsedItems.length === 0) {
+    return [];
+  }
+
+  return parsedItems.map(item => {
+    // 优先显示 names，如果没有则显示 name，最后显示 id
+    let displayName = item.id;
+    if (item.names) {
+      if (typeof item.names === 'object' && item.names !== null) {
+        const namesObj = item.names as Record<string, string>;
+        displayName = namesObj.CS || namesObj.cn || Object.values(namesObj)[0] || item.id;
+      } else {
+        displayName = String(item.names);
+      }
+    } else if (item.name) {
+      displayName = item.name;
+    }
+    return {
+      name: displayName,
+      count: item.count,
+      id: item.id
+    };
+  });
+}
+
+
+// 总数据条数
+const totalCount = computed(() => {
+  return props.serverData?.length || 0;
+});
+
+// 分页配置
+const pagination = computed(() => ({
+  page: currentPage.value,
+  pageSize: pageSize.value,
+  showSizePicker: true,
+  pageSizes: [10, 20, 50, 100],
+  showQuickJumper: true,
+  prefix: (info: any) => {
+    const count = totalCount.value;
+    return `共 ${count.toLocaleString()} 条`;
+  },
+  onUpdatePage: (page: number) => {
+    currentPage.value = page;
+  },
+  onUpdatePageSize: (size: number) => {
+    pageSize.value = size;
+    currentPage.value = 1;
+  }
+}));
+
+// 审核模式的列配置 - 不显示"发送至游戏服务器"和"游戏服务器返回信息"
+const columns = computed<DataTableColumns<ServerData>>(() => [
+  {
+    title: $t("page.manage.operateserver.roleName"),
+    key: "roleName",
+    align: "center",
+    width: 180,
+    ellipsis: { tooltip: true },
+  },
+  {
+    title: $t("page.manage.operateserver.roleId"),
+    key: "roleId",
+    align: "center",
+    width: 200,
+    ellipsis: { tooltip: true },
+  },
+  {
+    title: $t("page.manage.operateserver.serverName"),
+    key: "serverName",
+    align: "center",
+    width: 180,
+    ellipsis: { tooltip: true },
+  },
+  {
+    title: $t("page.manage.operateserver.goodsJson"),
+    key: "goods",
+    align: "center",
+    ellipsis: { tooltip: true },
+    minWidth: 400,
+    render: (row: ServerData, rowIndex: number) => {
+      const itemTags = formatItemsTags(row, rowIndex);
+      if (itemTags.length === 0) {
+        return h('span', { style: { color: '#909399', fontSize: '14px' } }, $t("common.none"));
+      }
+      return h(
+        'div',
+        {
+          class: 'flex-center flex-wrap',
+          style: {
+            gap: '8px',
+            padding: '4px 0'
+          }
+        },
+        itemTags.map((item: any, index: number) => {
+          return h(
+            NTag,
+            {
+              key: index,
+              type: 'info',
+              size: 'medium',
+              bordered: false,
+              style: {
+                padding: '0 12px',
+                fontSize: '13px'
+              }
+            },
+            {
+              default: () => `${item.name} × ${item.count.toLocaleString()}`
+            }
+          );
+        })
+      );
+    }
+  }
+]);
+
+function handleApprove() {
+  approveLoading.value = true;
+  emit("approve");
+}
+
+function handleReject() {
+  rejectLoading.value = true;
+  emit("reject");
+}
+
+// 监听弹窗关闭，重置 loading 状态
+watch(visible, (newVal) => {
+  if (!newVal) {
+    approveLoading.value = false;
+    rejectLoading.value = false;
+    currentPage.value = 1;
+    pageSize.value = 10;
+  } else {
+    loadItemData();
+  }
+});
+</script>
+
+<template>
+  <NModal
+    v-model:show="visible"
+    preset="card"
+    :title="`${$t('page.manage.operateserver.auditMail')}`"
+    style="width: 1400px; max-width: 95vw;"
+    :mask-closable="true"
+    :close-on-esc="true"
+  >
+    <template #header>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <span style="font-size: 16px; font-weight: 600;">{{ $t('page.manage.operateserver.auditMail') }}</span>
+        <NTag type="info" size="small" :bordered="false">
+          共 {{ totalCount.toLocaleString() }} 条数据
+        </NTag>
+      </div>
+    </template>
+
+    <div style="height: 600px; display: flex; flex-direction: column;">
+      <!-- 提示信息 -->
+      <div style="margin-bottom: 16px; padding: 12px; border-left: 4px solid #409eff; border-radius: 4px;">
+        <div style="color: #409eff; font-size: 14px; display: flex; align-items: center; gap: 8px;">
+          <icon-mdi-information style="font-size: 18px;" />
+          <span>请仔细核对以下邮件信息，确认无误后选择同意或拒绝</span>
+        </div>
+      </div>
+
+      <NDataTable
+        :columns="columns"
+        :data="props.serverData || []"
+        :bordered="true"
+        :pagination="pagination"
+        size="medium"
+        :max-height="440"
+        flex-height
+        style="flex: 1;"
+      />
+
+      <!-- 底部按钮区域 -->
+      <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e4e7ed; display: flex; justify-content: space-between; align-items: center;">
+        <div style="color: #909399; font-size: 13px;">
+          <icon-mdi-alert-circle-outline style="font-size: 16px; vertical-align: middle; margin-right: 4px;" />
+          审核操作不可撤销，请谨慎操作
+        </div>
+        <NSpace size="medium">
+          <NButton
+            type="error"
+            size="medium"
+            :loading="rejectLoading"
+            :disabled="approveLoading"
+            @click="handleReject"
+          >
+            <template #icon>
+              <icon-mdi-close-circle />
+            </template>
+            {{ $t("common.reject") }}
+          </NButton>
+          <NButton
+            type="success"
+            size="medium"
+            :loading="approveLoading"
+            :disabled="rejectLoading"
+            @click="handleApprove"
+          >
+            <template #icon>
+              <icon-mdi-check-circle />
+            </template>
+            {{ $t("common.approve") }}
+          </NButton>
+        </NSpace>
+      </div>
+    </div>
+  </NModal>
+</template>
+
+<style scoped></style>
